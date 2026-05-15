@@ -142,3 +142,4 @@ Makefile
 /windows/*.wixpdb
 build/
 .qoder/
+.mcp.json

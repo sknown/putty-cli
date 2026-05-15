@@ -236,6 +236,10 @@ endif()
 
 # Build CLI version of putty when GTK is not available (e.g., on macOS)
 if(NOT GTK_FOUND)
+  find_package(PkgConfig)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(CJSON libcjson)
+  endif()
   add_executable(putty
     putty-cli.c
     unicode.c
@@ -246,6 +250,12 @@ if(NOT GTK_FOUND)
     eventloop noterminal console sshclient otherbackends settings
     network crypto utils
     ${platform_libraries})
+  if(CJSON_FOUND)
+    target_compile_definitions(putty PRIVATE HAVE_CJSON=1)
+    target_include_directories(putty PRIVATE ${CJSON_INCLUDE_DIRS})
+    target_link_directories(putty PRIVATE ${CJSON_LIBRARY_DIRS})
+    target_link_libraries(putty cjson)
+  endif()
   installed_program(putty)
 endif()
 

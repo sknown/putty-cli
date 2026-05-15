@@ -44,6 +44,35 @@ PuTTY 原项目在 Unix/macOS 上依赖 GTK 图形库编译 GUI 版本（`putty`
   AI skill / MCP                              后台进程（nohup/launchd）
 ```
 
+### 4. MCP 模式（Model Context Protocol）
+
+新增 MCP STDIO 服务器模式，让 AI 客户端（如 Claude Desktop、Cursor 等）可以通过 MCP 协议直接调用远程命令执行：
+
+- **MCP 模式** (`--mcp socket-path`)：作为 MCP STDIO 服务器运行，通过 stdin/stdout 交换 JSON-RPC 消息。连接到已运行的 daemon，暴露以下工具：
+  - `execute_command` — 在远程服务器上执行命令，返回输出（支持 timeout 参数）
+  - `list_sessions` — 扫描目录下的 `.sock` 文件，列出活跃的 daemon 会话
+
+工作原理：
+```
+AI Client (Claude/Cursor)
+     │ stdin/stdout (JSON-RPC)
+     ▼
+putty --mcp /tmp/sock    ← MCP STDIO 服务器
+     │ Unix socket (raw relay)
+     ▼
+putty --daemon /tmp/sock ← 已有 daemon
+     │ SSH
+     ▼
+远程服务器
+```
+
+MCP 工具定义：
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `execute_command` | `command` (必填), `timeout` (可选，默认30秒) | 通过持久 SSH 连接执行远程命令 |
+| `list_sessions` | `directory` (可选，默认 /tmp) | 列出活跃的 putty-cli daemon 会话 |
+
 ## 编译方法
 
 ### 前置条件
@@ -51,6 +80,9 @@ PuTTY 原项目在 Unix/macOS 上依赖 GTK 图形库编译 GUI 版本（`putty`
 - macOS 或 Linux
 - C 编译器（macOS 自带的 `clang` 或 `gcc`）
 - CMake 3.7+
+- libcjson（可选，用于 MCP 模式。如未安装，将使用内置的轻量 JSON 解析器自动编译）
+
+macOS 安装 libcjson：`brew install cjson`
 
 ### 编译步骤
 
@@ -148,6 +180,48 @@ nohup ./build/putty --daemon /tmp/myserver.sock -P 2222 admin@example.com &
 
 # 带密码文件启动 daemon（非交互式）
 nohup ./build/putty --daemon /tmp/myserver.sock -pwfile ~/.ssh/pwd.txt user@example.com &
+
+# MCP 模式：启动 MCP STDIO 服务器（需先启动 daemon）
+./build/putty --mcp /tmp/myserver.sock
+```
+
+### Claude Desktop MCP 配置
+
+在 Claude Desktop 的配置文件中添加 putty-cli MCP 服务器：
+
+```json
+{
+  "mcpServers": {
+    "putty-ssh": {
+      "command": "/path/to/putty",
+      "args": ["--mcp", "/tmp/myserver.sock"]
+    }
+  }
+}
+```
+
+配置文件位置：
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+### Qoder IDE MCP 配置
+
+在项目根目录创建 `.mcp.json` 文件，Qoder IDE 会自动识别：
+
+```json
+{
+  "mcpServers": {
+    "putty-ssh": {
+      "command": "/path/to/putty",
+      "args": ["--mcp", "/tmp/myserver.sock"]
+    }
+  }
+}
+```
+
+使用前需确保 daemon 已启动：
+```bash
+nohup ./build/putty --daemon /tmp/myserver.sock user@example.com &
 ```
 
 ### plink 与 putty 的区别
@@ -167,8 +241,10 @@ nohup ./build/putty --daemon /tmp/myserver.sock -pwfile ~/.ssh/pwd.txt user@exam
 putty-0.83/
 ├── unix/
 │   ├── putty.c          # GUI putty 主程序（需 GTK）
-│   ├── putty-cli.c      # [新增] CLI putty 主程序（无 GTK 依赖）
+│   ├── putty-cli.c      # [新增] CLI putty 主程序（无 GTK 依赖，含 daemon/client/MCP 模式）
+│   ├── CMakeLists.txt   # [修改] 编译配置（CLI/GTK 自动切换，libcjson 检测）
 │   └── plink.c          # plink CLI 主程序
+├── .mcp.json             # [新增] Qoder IDE MCP 服务器配置
 ├── build/               # 构建输出目录
 ├── CMakeLists.txt       # 顶级 CMake 配置
 └── README.md            # 本文件

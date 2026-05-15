@@ -56,6 +56,8 @@ static bool daemon_client_input_done = false;
 static bufchain daemon_client_input_buf;
 static bool client_mode = false;
 static char *client_socket_path = NULL;
+static bool mcp_mode = false;
+static char *mcp_socket_path = NULL;
 
 /*
  * Default settings that are specific to Unix putty.
@@ -651,6 +653,9 @@ static void usage(void)
     printf("  --connect socket-path [command]\n");
     printf("            connect to a running putty-cli daemon\n");
     printf("            optional command is sent directly (no pipe needed)\n");
+    printf("  --mcp socket-path\n");
+    printf("            run as MCP server (STDIO transport)\n");
+    printf("            connects to daemon and serves MCP JSON-RPC on stdin/stdout\n");
 }
 
 static void version(void)
@@ -1029,6 +1034,750 @@ static int run_client_mode(const char *socket_path, const char *command)
     return exitcode;
 }
 
+/*
+ * MCP (Model Context Protocol) mode.
+ *
+ * Implements an MCP STDIO server that connects to a running daemon
+ * and exposes SSH command execution as MCP tools via JSON-RPC.
+ */
+
+#include <dirent.h>
+
+#ifdef HAVE_CJSON
+#include <cjson/cJSON.h>
+#else
+/* Minimal cJSON implementation for MCP mode */
+/* cJSON is a lightweight JSON parser. If not available via system package,
+ * we embed a minimal version that supports the MCP protocol messages. */
+typedef enum { cJSON_False=0, cJSON_True=1, cJSON_NULL=2, cJSON_Number=3,
+               cJSON_String=4, cJSON_Array=5, cJSON_Object=6 } cJSON_Type;
+
+typedef struct cJSON {
+    struct cJSON *next;
+    struct cJSON *prev;
+    struct cJSON *child;
+    cJSON_Type type;
+    char *valuestring;
+    int valueint;
+    double valuedouble;
+    char *string;
+} cJSON;
+
+static cJSON *cJSON_CreateObject(void) {
+    cJSON *item = snew(cJSON);
+    memset(item, 0, sizeof(*item));
+    item->type = cJSON_Object;
+    return item;
+}
+
+static cJSON *cJSON_CreateArray(void) {
+    cJSON *item = snew(cJSON);
+    memset(item, 0, sizeof(*item));
+    item->type = cJSON_Array;
+    return item;
+}
+
+static cJSON *cJSON_CreateString(const char *s) {
+    cJSON *item = snew(cJSON);
+    memset(item, 0, sizeof(*item));
+    item->type = cJSON_String;
+    item->valuestring = dupstr(s);
+    return item;
+}
+
+static void cJSON_Delete(cJSON *item) {
+    if (!item) return;
+    cJSON_Delete(item->child);
+    cJSON_Delete(item->next);
+    sfree(item->valuestring);
+    sfree(item->string);
+    sfree(item);
+}
+
+static cJSON *cJSON_AddItemToObject(cJSON *obj, const char *name, cJSON *item) {
+    if (!obj || obj->type != cJSON_Object || !item) return item;
+    item->string = dupstr(name);
+    if (!obj->child) {
+        obj->child = item;
+    } else {
+        cJSON *last = obj->child;
+        while (last->next) last = last->next;
+        last->next = item;
+        item->prev = last;
+    }
+    return item;
+}
+
+static cJSON *cJSON_AddItemToArray(cJSON *arr, cJSON *item) {
+    if (!arr || arr->type != cJSON_Array || !item) return item;
+    if (!arr->child) {
+        arr->child = item;
+    } else {
+        cJSON *last = arr->child;
+        while (last->next) last = last->next;
+        last->next = item;
+        item->prev = last;
+    }
+    return item;
+}
+
+static cJSON *cJSON_AddStringToObject(cJSON *obj, const char *name, const char *s) {
+    return cJSON_AddItemToObject(obj, name, cJSON_CreateString(s));
+}
+
+static cJSON *cJSON_AddNumberToObject(cJSON *obj, const char *name, double n) {
+    cJSON *item = snew(cJSON);
+    memset(item, 0, sizeof(*item));
+    item->type = cJSON_Number;
+    item->valuedouble = n;
+    item->valueint = (int)n;
+    return cJSON_AddItemToObject(obj, name, item);
+}
+
+static cJSON *cJSON_AddBoolToObject(cJSON *obj, const char *name, int b) {
+    cJSON *item = snew(cJSON);
+    memset(item, 0, sizeof(*item));
+    item->type = b ? cJSON_True : cJSON_False;
+    return cJSON_AddItemToObject(obj, name, item);
+}
+
+static cJSON *cJSON_AddObjectToObject(cJSON *obj, const char *name) {
+    return cJSON_AddItemToObject(obj, name, cJSON_CreateObject());
+}
+
+static cJSON *cJSON_AddArrayToObject(cJSON *obj, const char *name) {
+    return cJSON_AddItemToObject(obj, name, cJSON_CreateArray());
+}
+
+static cJSON *cJSON_GetObjectItem(cJSON *obj, const char *name) {
+    if (!obj || obj->type != cJSON_Object) return NULL;
+    cJSON *item = obj->child;
+    while (item) {
+        if (item->string && strcmp(item->string, name) == 0) return item;
+        item = item->next;
+    }
+    return NULL;
+}
+
+static const char *cJSON_GetStringValue(cJSON *item) {
+    if (!item || item->type != cJSON_String) return NULL;
+    return item->valuestring;
+}
+
+static int cJSON_IsNumber(cJSON *item) {
+    return item && item->type == cJSON_Number;
+}
+
+/* Minimal JSON string output — no pretty printing, handles strings with escaping */
+static strbuf *json_serialize(cJSON *item) {
+    strbuf *sb = strbuf_new();
+    if (!item) { put_dataz(sb, "null"); return sb; }
+    switch (item->type) {
+    case cJSON_False: put_dataz(sb, "false"); break;
+    case cJSON_True:  put_dataz(sb, "true"); break;
+    case cJSON_NULL:  put_dataz(sb, "null"); break;
+    case cJSON_Number:
+        if (item->valuedouble == (double)item->valueint)
+            put_fmt(sb, "%d", item->valueint);
+        else
+            put_fmt(sb, "%.17g", item->valuedouble);
+        break;
+    case cJSON_String: {
+        put_byte(sb, '"');
+        const char *s = item->valuestring;
+        if (s) {
+            for (; *s; s++) {
+                switch (*s) {
+                case '"':  put_dataz(sb, "\\\""); break;
+                case '\\': put_dataz(sb, "\\\\"); break;
+                case '\b': put_dataz(sb, "\\b"); break;
+                case '\f': put_dataz(sb, "\\f"); break;
+                case '\n': put_dataz(sb, "\\n"); break;
+                case '\r': put_dataz(sb, "\\r"); break;
+                case '\t': put_dataz(sb, "\\t"); break;
+                default:
+                    if ((unsigned char)*s < 0x20)
+                        put_fmt(sb, "\\u%04x", (unsigned char)*s);
+                    else
+                        put_byte(sb, *s);
+                }
+            }
+        }
+        put_byte(sb, '"');
+        break;
+    }
+    case cJSON_Array: {
+        put_byte(sb, '[');
+        cJSON *child = item->child;
+        while (child) {
+            strbuf *child_sb = json_serialize(child);
+            put_data(sb, child_sb->s, child_sb->len);
+            strbuf_free(child_sb);
+            child = child->next;
+            if (child) put_byte(sb, ',');
+        }
+        put_byte(sb, ']');
+        break;
+    }
+    case cJSON_Object: {
+        put_byte(sb, '{');
+        cJSON *child = item->child;
+        while (child) {
+            put_byte(sb, '"');
+            if (child->string) put_dataz(sb, child->string);
+            put_dataz(sb, "\":");
+            strbuf *child_sb = json_serialize(child);
+            put_data(sb, child_sb->s, child_sb->len);
+            strbuf_free(child_sb);
+            child = child->next;
+            if (child) put_byte(sb, ',');
+        }
+        put_byte(sb, '}');
+        break;
+    }
+    }
+    return sb;
+}
+
+static char *cJSON_PrintUnformatted(cJSON *item) {
+    strbuf *sb = json_serialize(item);
+    char *result = strbuf_to_str(sb);
+    return result;
+}
+
+/* Minimal JSON parser — just enough for MCP messages */
+static cJSON *cJSON_Parse(const char *value) {
+    /* Recursive descent parser */
+    const char **sp = &value;
+    /* Skip whitespace */
+    #define SKIP_WS() while (**sp == ' ' || **sp == '\t' || **sp == '\n' || **sp == '\r') (*sp)++
+
+    /* Forward declarations */
+    static cJSON *parse_value(const char **sp);
+    static cJSON *parse_string(const char **sp);
+    static cJSON *parse_array(const char **sp);
+    static cJSON *parse_object(const char **sp);
+
+    static cJSON *parse_string(const char **sp) {
+        if (**sp != '"') return NULL;
+        (*sp)++; /* skip opening quote */
+        strbuf *sb = strbuf_new();
+        while (**sp && **sp != '"') {
+            if (**sp == '\\') {
+                (*sp)++;
+                switch (**sp) {
+                case '"':  put_byte(sb, '"'); break;
+                case '\\': put_byte(sb, '\\'); break;
+                case '/':  put_byte(sb, '/'); break;
+                case 'b':  put_byte(sb, '\b'); break;
+                case 'f':  put_byte(sb, '\f'); break;
+                case 'n':  put_byte(sb, '\n'); break;
+                case 'r':  put_byte(sb, '\r'); break;
+                case 't':  put_byte(sb, '\t'); break;
+                case 'u': {
+                    /* Simple \uXXXX handling: just skip for now,
+                     * treat ASCII-range chars as literal */
+                    unsigned int cp = 0;
+                    (*sp)++;
+                    for (int i = 0; i < 4 && **sp; i++, (*sp)++) {
+                        cp <<= 4;
+                        if (**sp >= '0' && **sp <= '9') cp += **sp - '0';
+                        else if (**sp >= 'a' && **sp <= 'f') cp += **sp - 'a' + 10;
+                        else if (**sp >= 'A' && **sp <= 'F') cp += **sp - 'A' + 10;
+                    }
+                    (*sp)--; /* will be incremented below */
+                    if (cp < 0x80) put_byte(sb, (char)cp);
+                    else { put_dataz(sb, "?"); } /* non-ASCII: placeholder */
+                    break;
+                }
+                default: put_byte(sb, **sp); break;
+                }
+            } else {
+                put_byte(sb, **sp);
+            }
+            (*sp)++;
+        }
+        if (**sp == '"') (*sp)++; /* skip closing quote */
+        cJSON *item = cJSON_CreateString(sb->s);
+        strbuf_free(sb);
+        return item;
+    }
+
+    static cJSON *parse_array(const char **sp) {
+        cJSON *arr = cJSON_CreateArray();
+        (*sp)++; /* skip '[' */
+        SKIP_WS();
+        if (**sp == ']') { (*sp)++; return arr; }
+        while (1) {
+            SKIP_WS();
+            cJSON *val = parse_value(sp);
+            if (!val) { cJSON_Delete(arr); return NULL; }
+            cJSON_AddItemToArray(arr, val);
+            SKIP_WS();
+            if (**sp == ',') { (*sp)++; continue; }
+            if (**sp == ']') { (*sp)++; break; }
+            cJSON_Delete(arr); return NULL;
+        }
+        return arr;
+    }
+
+    static cJSON *parse_object(const char **sp) {
+        cJSON *obj = cJSON_CreateObject();
+        (*sp)++; /* skip '{' */
+        SKIP_WS();
+        if (**sp == '}') { (*sp)++; return obj; }
+        while (1) {
+            SKIP_WS();
+            if (**sp != '"') { cJSON_Delete(obj); return NULL; }
+            cJSON *key = parse_string(sp);
+            if (!key) { cJSON_Delete(obj); return NULL; }
+            SKIP_WS();
+            if (**sp != ':') { cJSON_Delete(key); cJSON_Delete(obj); return NULL; }
+            (*sp)++; /* skip ':' */
+            SKIP_WS();
+            cJSON *val = parse_value(sp);
+            if (!val) { cJSON_Delete(key); cJSON_Delete(obj); return NULL; }
+            /* Transfer key name to val */
+            val->string = key->valuestring;
+            key->valuestring = NULL;
+            cJSON_Delete(key);
+            /* Add to object */
+            if (!obj->child) {
+                obj->child = val;
+            } else {
+                cJSON *last = obj->child;
+                while (last->next) last = last->next;
+                last->next = val;
+                val->prev = last;
+            }
+            SKIP_WS();
+            if (**sp == ',') { (*sp)++; continue; }
+            if (**sp == '}') { (*sp)++; break; }
+            cJSON_Delete(obj); return NULL;
+        }
+        return obj;
+    }
+
+    static cJSON *parse_value(const char **sp) {
+        SKIP_WS();
+        if (**sp == '"') return parse_string(sp);
+        if (**sp == '{') return parse_object(sp);
+        if (**sp == '[') return parse_array(sp);
+        if (**sp == 't') { /* true */
+            if (strncmp(*sp, "true", 4) == 0) {
+                *sp += 4;
+                cJSON *item = snew(cJSON);
+                memset(item, 0, sizeof(*item));
+                item->type = cJSON_True;
+                return item;
+            }
+            return NULL;
+        }
+        if (**sp == 'f') { /* false */
+            if (strncmp(*sp, "false", 5) == 0) {
+                *sp += 5;
+                cJSON *item = snew(cJSON);
+                memset(item, 0, sizeof(*item));
+                item->type = cJSON_False;
+                return item;
+            }
+            return NULL;
+        }
+        if (**sp == 'n') { /* null */
+            if (strncmp(*sp, "null", 4) == 0) {
+                *sp += 4;
+                cJSON *item = snew(cJSON);
+                memset(item, 0, sizeof(*item));
+                item->type = cJSON_NULL;
+                return item;
+            }
+            return NULL;
+        }
+        /* Number */
+        {
+            char *end;
+            double d = strtod(*sp, &end);
+            if (end == *sp) return NULL;
+            *sp = end;
+            cJSON *item = snew(cJSON);
+            memset(item, 0, sizeof(*item));
+            item->type = cJSON_Number;
+            item->valuedouble = d;
+            item->valueint = (int)d;
+            return item;
+        }
+    }
+
+    #undef SKIP_WS
+
+    SKIP_WS();
+    if (**sp == '\0') return NULL;
+    return parse_value(sp);
+}
+#endif /* HAVE_CJSON */
+
+/* Connect to daemon socket — returns fd or -1 */
+static int mcp_connect_daemon(const char *socket_path)
+{
+    struct sockaddr_un addr;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Execute a command on the remote server via daemon socket.
+ * Returns the output as a malloc'd string, or NULL on error. */
+static char *mcp_execute_on_daemon(const char *socket_path,
+                                    const char *command, int timeout_sec)
+{
+    int fd = mcp_connect_daemon(socket_path);
+    if (fd < 0)
+        return dupprintf("Error: cannot connect to daemon at '%s': %s",
+                         socket_path, strerror(errno));
+
+    /* Send command */
+    char *cmdline = dupprintf("%s\n", command);
+    ssize_t wret = write(fd, cmdline, strlen(cmdline));
+    sfree(cmdline);
+    if (wret < 0) {
+        close(fd);
+        return dupstr("Error: failed to send command to daemon");
+    }
+
+    /* Read response with timeout */
+    strbuf *output = strbuf_new();
+    char buf[4096];
+    bool saw_data = false;
+    struct timeval last_data_time;
+    struct timeval start_time;
+    gettimeofday(&start_time, NULL);
+
+    while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        struct timeval tv;
+        if (saw_data) {
+            tv.tv_sec = 0;
+            tv.tv_usec = 200000;  /* 200ms poll interval */
+        } else {
+            tv.tv_sec = timeout_sec;
+            tv.tv_usec = 0;
+        }
+
+        int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ret == 0) {
+            /* Timeout */
+            if (saw_data) {
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                long elapsed_ms = (now.tv_sec - last_data_time.tv_sec) * 1000
+                    + (now.tv_usec - last_data_time.tv_usec) / 1000;
+                if (elapsed_ms >= 500) break;  /* 500ms idle = command done */
+            } else {
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                if (now.tv_sec - start_time.tv_sec >= timeout_sec) {
+                    put_dataz(output, "[timeout: no response within ");
+                    put_dataz(output, dupprintf("%d", timeout_sec));
+                    put_dataz(output, " seconds]");
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (FD_ISSET(fd, &rfds)) {
+            ret = read(fd, buf, sizeof(buf));
+            if (ret > 0) {
+                put_data(output, buf, ret);
+                saw_data = true;
+                gettimeofday(&last_data_time, NULL);
+            } else {
+                /* EOF or error */
+                break;
+            }
+        }
+    }
+
+    close(fd);
+    return strbuf_to_str(output);
+}
+
+/* List active daemon sessions by scanning a directory for .sock files. */
+static char *mcp_list_sessions(const char *directory)
+{
+    DIR *dir = opendir(directory);
+    if (!dir)
+        return dupprintf("Error: cannot open directory '%s': %s",
+                         directory, strerror(errno));
+
+    strbuf *result = strbuf_new();
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        size_t namelen = strlen(name);
+        if (namelen < 5 || strcmp(name + namelen - 5, ".sock") != 0)
+            continue;
+
+        char *path = dupprintf("%s/%s", directory, name);
+        /* Try to connect to check if daemon is alive */
+        int fd = mcp_connect_daemon(path);
+        if (fd >= 0) {
+            close(fd);
+            if (result->len > 0)
+                put_byte(result, '\n');
+            put_dataz(result, path);
+        }
+        sfree(path);
+    }
+    closedir(dir);
+
+    if (result->len == 0)
+        put_dataz(result, "(no active sessions)");
+
+    return strbuf_to_str(result);
+}
+
+/* Write a JSON-RPC response to stdout.
+ * Takes a cJSON object representing the full response. */
+static void mcp_write_response(cJSON *response)
+{
+    char *json_str = cJSON_PrintUnformatted(response);
+    fprintf(stdout, "%s\n", json_str);
+    fflush(stdout);
+#ifdef HAVE_CJSON
+    free(json_str);
+#else
+    sfree(json_str);
+#endif
+    cJSON_Delete(response);
+}
+
+/* Build and send a JSON-RPC error response. */
+static void mcp_send_error(int id, int code, const char *message)
+{
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "jsonrpc", "2.0");
+    cJSON_AddNumberToObject(resp, "id", id);
+    cJSON *error = cJSON_AddObjectToObject(resp, "error");
+    cJSON_AddNumberToObject(error, "code", code);
+    cJSON_AddStringToObject(error, "message", message);
+    mcp_write_response(resp);
+}
+
+/* Build and send a JSON-RPC result response. */
+static void mcp_send_result(int id, cJSON *result)
+{
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "jsonrpc", "2.0");
+    cJSON_AddNumberToObject(resp, "id", id);
+    cJSON_AddItemToObject(resp, "result", result);
+    mcp_write_response(resp);
+}
+
+/* Handle 'initialize' method. */
+static void mcp_handle_initialize(int id)
+{
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddStringToObject(result, "protocolVersion", "2025-03-26");
+
+    cJSON *caps = cJSON_AddObjectToObject(result, "capabilities");
+    cJSON *tools = cJSON_AddObjectToObject(caps, "tools");
+    cJSON_AddBoolToObject(tools, "listChanged", false);
+
+    cJSON *info = cJSON_AddObjectToObject(result, "serverInfo");
+    cJSON_AddStringToObject(info, "name", "putty-cli");
+    cJSON_AddStringToObject(info, "version", "0.83");
+
+    mcp_send_result(id, result);
+}
+
+/* Handle 'tools/list' method. */
+static void mcp_handle_tools_list(int id)
+{
+    cJSON *result = cJSON_CreateObject();
+    cJSON *tools = cJSON_AddArrayToObject(result, "tools");
+
+    /* execute_command tool */
+    {
+        cJSON *tool = cJSON_CreateObject();
+        cJSON_AddStringToObject(tool, "name", "execute_command");
+        cJSON_AddStringToObject(tool, "description",
+            "Execute a command on the remote server via the persistent SSH connection. "
+            "Returns the command output as text.");
+        cJSON *schema = cJSON_AddObjectToObject(tool, "inputSchema");
+        cJSON_AddStringToObject(schema, "type", "object");
+        cJSON *props = cJSON_AddObjectToObject(schema, "properties");
+        {
+            cJSON *cmd = cJSON_AddObjectToObject(props, "command");
+            cJSON_AddStringToObject(cmd, "type", "string");
+            cJSON_AddStringToObject(cmd, "description", "Command to execute on the remote server");
+        }
+        {
+            cJSON *tmo = cJSON_AddObjectToObject(props, "timeout");
+            cJSON_AddStringToObject(tmo, "type", "integer");
+            cJSON_AddStringToObject(tmo, "description", "Timeout in seconds (default 30)");
+        }
+        cJSON *required = cJSON_AddArrayToObject(schema, "required");
+        cJSON_AddItemToArray(required, cJSON_CreateString("command"));
+        cJSON_AddItemToArray(tools, tool);
+    }
+
+    /* list_sessions tool */
+    {
+        cJSON *tool = cJSON_CreateObject();
+        cJSON_AddStringToObject(tool, "name", "list_sessions");
+        cJSON_AddStringToObject(tool, "description",
+            "List active putty-cli daemon sessions. Scans a directory for Unix socket "
+            "files and checks which ones have a running daemon.");
+        cJSON *schema = cJSON_AddObjectToObject(tool, "inputSchema");
+        cJSON_AddStringToObject(schema, "type", "object");
+        cJSON *props = cJSON_AddObjectToObject(schema, "properties");
+        {
+            cJSON *dir = cJSON_AddObjectToObject(props, "directory");
+            cJSON_AddStringToObject(dir, "type", "string");
+            cJSON_AddStringToObject(dir, "description",
+                "Directory to scan for socket files (default /tmp)");
+        }
+        cJSON_AddItemToArray(tools, tool);
+    }
+
+    mcp_send_result(id, result);
+}
+
+/* Handle 'tools/call' method. */
+static void mcp_handle_tools_call(int id, cJSON *params)
+{
+    const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(params, "name"));
+    if (!name) {
+        mcp_send_error(id, -32602, "Missing 'name' in tools/call params");
+        return;
+    }
+
+    cJSON *arguments = cJSON_GetObjectItem(params, "arguments");
+    const char *output = NULL;
+    bool is_error = false;
+
+    if (strcmp(name, "execute_command") == 0) {
+        const char *command = cJSON_GetStringValue(
+            cJSON_GetObjectItem(arguments, "command"));
+        if (!command || !*command) {
+            mcp_send_error(id, -32602, "Missing or empty 'command' argument");
+            return;
+        }
+        int timeout = 30;
+        cJSON *tmo = cJSON_GetObjectItem(arguments, "timeout");
+        if (tmo && cJSON_IsNumber(tmo))
+            timeout = tmo->valueint;
+        if (timeout <= 0) timeout = 30;
+
+        output = mcp_execute_on_daemon(mcp_socket_path, command, timeout);
+        is_error = (strncmp(output, "Error:", 6) == 0);
+    } else if (strcmp(name, "list_sessions") == 0) {
+        const char *directory = cJSON_GetStringValue(
+            cJSON_GetObjectItem(arguments, "directory"));
+        if (!directory || !*directory)
+            directory = "/tmp";
+        output = mcp_list_sessions(directory);
+        is_error = (strncmp(output, "Error:", 6) == 0);
+    } else {
+        mcp_send_error(id, -32601,
+                       dupprintf("Unknown tool: %s", name));
+        return;
+    }
+
+    /* Build result */
+    cJSON *result = cJSON_CreateObject();
+    cJSON *content = cJSON_AddArrayToObject(result, "content");
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddStringToObject(item, "type", "text");
+    cJSON_AddStringToObject(item, "text", output);
+    cJSON_AddItemToArray(content, item);
+    cJSON_AddBoolToObject(result, "isError", is_error);
+
+    sfree((void *)output);
+    mcp_send_result(id, result);
+}
+
+/* MCP main loop: read JSON-RPC from stdin, process, write responses to stdout. */
+static int run_mcp_mode(const char *socket_path)
+{
+    char line[65536];
+
+    /* Verify daemon is reachable */
+    int test_fd = mcp_connect_daemon(socket_path);
+    if (test_fd < 0) {
+        fprintf(stderr, "putty: cannot connect to daemon at '%s': %s\n",
+                socket_path, strerror(errno));
+        return 1;
+    }
+    close(test_fd);
+
+    /* Read lines from stdin */
+    while (fgets(line, sizeof(line), stdin)) {
+        /* Strip trailing newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+
+        if (len == 0) continue;
+
+        /* Parse JSON-RPC message */
+        cJSON *msg = cJSON_Parse(line);
+        if (!msg) {
+            mcp_send_error(0, -32700, "Parse error: invalid JSON");
+            continue;
+        }
+
+        const char *method = cJSON_GetStringValue(
+            cJSON_GetObjectItem(msg, "method"));
+        cJSON *id_obj = cJSON_GetObjectItem(msg, "id");
+        int id = id_obj ? id_obj->valueint : 0;
+        cJSON *params = cJSON_GetObjectItem(msg, "params");
+
+        if (!method) {
+            /* Could be a response to a server-initiated request — ignore */
+            cJSON_Delete(msg);
+            continue;
+        }
+
+        if (strcmp(method, "initialize") == 0) {
+            mcp_handle_initialize(id);
+        } else if (strcmp(method, "notifications/initialized") == 0) {
+            /* No response needed for notifications */
+        } else if (strcmp(method, "tools/list") == 0) {
+            mcp_handle_tools_list(id);
+        } else if (strcmp(method, "tools/call") == 0) {
+            mcp_handle_tools_call(id, params);
+        } else if (strcmp(method, "ping") == 0) {
+            cJSON *result = cJSON_CreateObject();
+            mcp_send_result(id, result);
+        } else {
+            mcp_send_error(id, -32601,
+                           dupprintf("Method not found: %s", method));
+        }
+
+        cJSON_Delete(msg);
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int exitcode;
@@ -1140,6 +1889,16 @@ int main(int argc, char **argv)
                         " requires a socket path argument\n");
                 errors = true;
             }
+        } else if (!strcmp(p, "--mcp")) {
+            if (nextarg) {
+                mcp_mode = true;
+                mcp_socket_path = dupstr(cmdline_arg_to_str(nextarg));
+                arglistpos++;
+            } else {
+                fprintf(stderr, "putty: option \"--mcp\""
+                        " requires a socket path argument\n");
+                errors = true;
+            }
         } else if (*p != '-') {
             strbuf *cmdbuf = strbuf_new();
 
@@ -1183,6 +1942,12 @@ int main(int argc, char **argv)
         }
         return run_client_mode(client_socket_path,
                                (cmd && *cmd) ? cmd : NULL);
+    }
+
+    /* If in MCP mode, skip SSH setup and run MCP server */
+    if (mcp_mode) {
+        cmdline_arg_list_free(arglist);
+        return run_mcp_mode(mcp_socket_path);
     }
 
     if (!cmdline_host_ok(conf)) {
