@@ -25,6 +25,25 @@ PuTTY 原项目在 Unix/macOS 上依赖 GTK 图形库编译 GUI 版本（`putty`
 - **GTK 可用时** — 编译原版 GUI `putty`（不变）
 - **GTK 不可用时** — 编译 CLI `putty`，链接 `noterminal` + `console` 库，无需 GTK 依赖
 
+### 3. Daemon/Client 模式（AI 工具集成支持）
+
+在 `putty-cli.c` 中新增了 daemon/client 模式，用于持久化 SSH 连接，方便 AI 工具（如 AI skill/MCP）多次调用：
+
+- **Daemon 模式** (`--daemon socket-path`)：建立 SSH 连接后，通过 Unix domain socket 监听客户端连接。SSH 会话保持活跃，多个客户端可以依次连接、发送数据、断开，而 SSH 连接不中断。前台运行时按 Ctrl+C 可正常退出并自动清理 socket 文件。
+- **Client 模式** (`--connect socket-path [command]`)：作为轻量客户端连接 daemon 的 Unix socket，将 stdin 数据转发给 daemon，daemon 回复的数据输出到 stdout。支持直接在命令行传递要执行的远程命令（如 `putty --connect /tmp/sock hostname`），无需通过管道。
+
+工作原理：
+```
+┌─────────────────┐     Unix socket      ┌──────────────────┐
+│  putty --connect │ ◄──────────────────► │  putty --daemon  │ ◄──── SSH ────► 远程服务器
+│  (client)        │     /tmp/xxx.sock    │  (持久连接)       │
+└─────────────────┘                       └──────────────────┘
+      ▲                                            ▲
+      │ 多次调用，共享同一 SSH 连接                   │ 一次建立，持续保活
+      ▼                                            ▼
+  AI skill / MCP                              后台进程（nohup/launchd）
+```
+
 ## 编译方法
 
 ### 前置条件
@@ -109,6 +128,26 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_DISABLE_FIND_PACKAGE_GTK3=ON
 
 # 使用代理命令
 ./build/putty -proxycmd 'nc %host %port' user@example.com
+
+# Daemon 模式：启动持久 SSH 连接（后台运行）
+nohup ./build/putty --daemon /tmp/myserver.sock user@example.com &
+
+# Daemon 模式：前台运行（Ctrl+C 退出，自动清理 socket）
+./build/putty --daemon /tmp/myserver.sock user@example.com
+
+# Client 模式：通过 daemon 执行命令（管道方式）
+echo "ls -la" | ./build/putty --connect /tmp/myserver.sock
+echo "uptime" | ./build/putty --connect /tmp/myserver.sock
+
+# Client 模式：直接传命令执行（无需管道）
+./build/putty --connect /tmp/myserver.sock "ls -la"
+./build/putty --connect /tmp/myserver.sock "hostname"
+
+# 指定 SSH 端口启动 daemon
+nohup ./build/putty --daemon /tmp/myserver.sock -P 2222 admin@example.com &
+
+# 带密码文件启动 daemon（非交互式）
+nohup ./build/putty --daemon /tmp/myserver.sock -pwfile ~/.ssh/pwd.txt user@example.com &
 ```
 
 ### plink 与 putty 的区别
@@ -138,4 +177,3 @@ putty-0.83/
 ## 许可证
 
 本项目基于 PuTTY 原始许可证（MIT 类许可证）。详见 `LICENCE` 文件。
-# putty-cli

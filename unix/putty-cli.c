@@ -19,6 +19,8 @@
 #include <pwd.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include "putty.h"
 #include "ssh.h"
@@ -44,6 +46,16 @@ static bool local_tty = false; /* do we have a local tty? */
 
 static Backend *backend;
 static Conf *conf;
+
+/* Daemon / client mode */
+static bool daemon_mode = false;
+static char *daemon_socket_path = NULL;
+static int daemon_listen_fd = -1;
+static int daemon_client_fd = -1;
+static bool daemon_client_input_done = false;
+static bufchain daemon_client_input_buf;
+static bool client_mode = false;
+static char *client_socket_path = NULL;
 
 /*
  * Default settings that are specific to Unix putty.
@@ -83,6 +95,86 @@ Filename *platform_default_filename(const char *name)
 char *x_get_default(const char *key)
 {
     return NULL;                       /* this is a stub */
+}
+
+/*
+ * Daemon mode: Unix domain socket management
+ */
+static int create_daemon_socket(const char *path)
+{
+    struct sockaddr_un addr;
+    int fd, ret;
+
+    unlink(path);    /* remove existing socket file */
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "putty: unable to create daemon socket: %s\n",
+                strerror(errno));
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0) {
+        fprintf(stderr, "putty: unable to bind daemon socket '%s': %s\n",
+                path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    ret = listen(fd, 5);
+    if (ret < 0) {
+        fprintf(stderr, "putty: unable to listen on daemon socket: %s\n",
+                strerror(errno));
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+
+    nonblock(fd);
+    cloexec(fd);
+    return fd;
+}
+
+static int accept_daemon_client(int listen_fd)
+{
+    struct sockaddr_un addr;
+    socklen_t addrlen = sizeof(addr);
+    int fd = accept(listen_fd, (struct sockaddr *)&addr, &addrlen);
+    if (fd < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            fprintf(stderr, "putty: accept: %s\n", strerror(errno));
+        return -1;
+    }
+    nonblock(fd);
+    return fd;
+}
+
+static void close_daemon_client(void)
+{
+    if (daemon_client_fd >= 0) {
+        close(daemon_client_fd);
+        daemon_client_fd = -1;
+    }
+    bufchain_clear(&daemon_client_input_buf);
+    daemon_client_input_done = false;
+}
+
+static void cleanup_daemon_socket(void)
+{
+    if (daemon_listen_fd >= 0) {
+        close(daemon_listen_fd);
+        daemon_listen_fd = -1;
+    }
+    if (daemon_socket_path) {
+        unlink(daemon_socket_path);
+        sfree(daemon_socket_path);
+        daemon_socket_path = NULL;
+    }
 }
 
 static void putty_cli_echoedit_update(Seat *seat, bool echo, bool edit)
@@ -287,7 +379,18 @@ static size_t output_backlog(void)
 void try_output(bool is_stderr)
 {
     bufchain *chain = (is_stderr ? &stderr_data : &stdout_data);
-    int fd = (is_stderr ? STDERR_FILENO : STDOUT_FILENO);
+    int fd;
+
+    if (daemon_mode && daemon_client_fd >= 0) {
+        fd = daemon_client_fd;
+    } else if (daemon_mode) {
+        /* Daemon mode with no client: discard output silently */
+        bufchain_clear(chain);
+        backend_unthrottle(backend, output_backlog());
+        return;
+    } else {
+        fd = (is_stderr ? STDERR_FILENO : STDOUT_FILENO);
+    }
     ssize_t ret;
 
     if (bufchain_size(chain) > 0) {
@@ -354,6 +457,24 @@ static bool putty_cli_seat_interactive(Seat *seat)
             !*conf_get_str(conf, CONF_ssh_nc_host));
 }
 
+/*
+ * In daemon mode, auto-accept unknown host keys without caching
+ * (equivalent to pressing 'n' at the interactive prompt).
+ */
+static SeatPromptResult putty_cli_confirm_ssh_host_key(
+    Seat *seat, const char *host, int port, const char *keytype,
+    char *keystr, SeatDialogText *text, HelpCtx helpctx,
+    void (*callback)(void *ctx, SeatPromptResult result), void *ctx)
+{
+    if (daemon_mode) {
+        /* Accept without storing - daemon is non-interactive */
+        return SPR_OK;
+    }
+    return console_confirm_ssh_host_key(
+        seat, host, port, keytype, keystr, text, helpctx,
+        callback, ctx);
+}
+
 static const SeatVtable putty_cli_seat_vt = {
     .output = putty_cli_output,
     .eof = putty_cli_eof,
@@ -368,7 +489,7 @@ static const SeatVtable putty_cli_seat_vt = {
     .update_specials_menu = nullseat_update_specials_menu,
     .get_ttymode = putty_cli_get_ttymode,
     .set_busy_status = nullseat_set_busy_status,
-    .confirm_ssh_host_key = console_confirm_ssh_host_key,
+    .confirm_ssh_host_key = putty_cli_confirm_ssh_host_key,
     .confirm_weak_crypto_primitive = console_confirm_weak_crypto_primitive,
     .confirm_weak_cached_hostkey = console_confirm_weak_cached_hostkey,
     .prompt_descriptions = console_prompt_descriptions,
@@ -439,10 +560,21 @@ static void from_tty(void *vbuf, unsigned len)
 }
 
 static int signalpipe[2];
+static volatile sig_atomic_t sigint_pending = false;
 
 void sigwinch(int signum)
 {
     if (write(signalpipe[1], "x", 1) <= 0)
+        /* not much we can do about it */;
+}
+
+void sigint(int signum)
+{
+    /* In daemon mode, Ctrl+C should terminate the process.
+     * Set a flag and wake up the main loop by writing to the
+     * signal pipe, so poll() returns instead of blocking forever. */
+    sigint_pending = true;
+    if (write(signalpipe[1], "i", 1) <= 0)
         /* not much we can do about it */;
 }
 
@@ -513,6 +645,12 @@ static void usage(void)
     printf("            control what happens when a log file already exists\n");
     printf("  -shareexists\n");
     printf("            test whether a connection-sharing upstream exists\n");
+    printf("  --daemon socket-path\n");
+    printf("            run in daemon mode, listening on Unix socket\n");
+    printf("            (persistent SSH connection for AI tooling)\n");
+    printf("  --connect socket-path [command]\n");
+    printf("            connect to a running putty-cli daemon\n");
+    printf("            optional command is sent directly (no pipe needed)\n");
 }
 
 static void version(void)
@@ -610,6 +748,287 @@ static bool putty_cli_continue(void *vctx, bool found_any_fd,
     return true;
 }
 
+/*
+ * Daemon mode event loop functions.
+ *
+ * In daemon mode, instead of reading from stdin and writing to stdout,
+ * we listen on a Unix domain socket and relay I/O with connected clients.
+ * The SSH connection stays alive between client invocations.
+ */
+static bool putty_daemon_pw_setup(void *vctx, pollwrapper *pw)
+{
+    /* Check SIGINT flag directly — don't rely solely on signalpipe,
+     * since the main loop may restart poll() on EINTR and miss it. */
+    if (sigint_pending)
+        return false;
+
+    pollwrap_add_fd_rwx(pw, signalpipe[0], SELECT_R);
+
+    /* Daemon mode: ensure ISIG stays on and monitor stdin for Ctrl+C.
+     *
+     * Some code paths (e.g. console_get_userpass_input) may temporarily
+     * modify terminal settings. In rare cases ISIG can end up off, which
+     * prevents Ctrl+C from generating SIGINT. We restore ISIG here as
+     * a watchdog, and also poll stdin so that if ISIG IS off, we can
+     * detect Ctrl+C (0x03) as regular input. */
+    if (daemon_mode && isatty(STDIN_FILENO)) {
+        struct termios tio;
+        if (tcgetattr(STDIN_FILENO, &tio) == 0) {
+            if (!(tio.c_lflag & ISIG)) {
+                tio.c_lflag |= ISIG;
+                tcsetattr(STDIN_FILENO, TCSANOW, &tio);
+            }
+        }
+        pollwrap_add_fd_rwx(pw, STDIN_FILENO, SELECT_R);
+    }
+
+    /* Always listen for new client connections */
+    if (daemon_listen_fd >= 0) {
+        pollwrap_add_fd_rwx(pw, daemon_listen_fd, SELECT_R);
+    }
+
+    /* Flush any buffered client input now that backend may be ready */
+    if (bufchain_size(&daemon_client_input_buf) > 0) {
+        if (backend_connected(backend) && backend_sendok(backend)) {
+            while (bufchain_size(&daemon_client_input_buf) > 0 &&
+                   backend_sendok(backend)) {
+                ptrlen data = bufchain_prefix(&daemon_client_input_buf);
+                backend_send(backend, data.ptr, data.len);
+                bufchain_consume(&daemon_client_input_buf, data.len);
+            }
+        }
+    }
+
+    /* If we have a connected client, handle I/O */
+    if (daemon_client_fd >= 0) {
+        /* Poll for reading from client if buffer isn't too large */
+        if (!daemon_client_input_done &&
+            bufchain_size(&daemon_client_input_buf) < MAX_STDIN_BACKLOG) {
+            pollwrap_add_fd_rwx(pw, daemon_client_fd, SELECT_R);
+        }
+
+        if (bufchain_size(&stdout_data) > 0 ||
+            bufchain_size(&stderr_data) > 0) {
+            pollwrap_add_fd_rwx(pw, daemon_client_fd, SELECT_W);
+        }
+    }
+
+    return true;
+}
+
+static void putty_daemon_pw_check(void *vctx, pollwrapper *pw)
+{
+    /* Handle signal pipe (SIGWINCH / SIGINT) */
+    if (pollwrap_check_fd_rwx(pw, signalpipe[0], SELECT_R)) {
+        char c[1];
+        if (read(signalpipe[0], c, 1) <= 0)
+            /* ignore error */;
+        if (sigint_pending)
+            return;  /* putty_daemon_continue will return false */
+    }
+
+    /* Daemon mode: monitor stdin for Ctrl+C (0x03).
+     * This is a fallback for when ISIG is off — if ISIG is on,
+     * Ctrl+C generates SIGINT instead of being received as data. */
+    if (daemon_mode && isatty(STDIN_FILENO) &&
+        pollwrap_check_fd_rwx(pw, STDIN_FILENO, SELECT_R)) {
+        char buf[32];
+        int ret = read(STDIN_FILENO, buf, sizeof(buf));
+        if (ret > 0) {
+            for (int i = 0; i < ret; i++) {
+                if ((unsigned char)buf[i] == 3) { /* Ctrl+C */
+                    sigint_pending = true;
+                    return;
+                }
+            }
+        }
+        /* Discard any other stdin input — daemon doesn't use it */
+    }
+
+    /* Accept new client connections */
+    if (daemon_listen_fd >= 0 &&
+        pollwrap_check_fd_rwx(pw, daemon_listen_fd, SELECT_R)) {
+        /* If a previous client is still connected, close it first */
+        if (daemon_client_fd >= 0) {
+            close_daemon_client();
+            daemon_client_input_done = false;
+        }
+        daemon_client_fd = accept_daemon_client(daemon_listen_fd);
+        daemon_client_input_done = false;
+    }
+
+    /* Handle I/O with connected client */
+    if (daemon_client_fd >= 0) {
+        if (!daemon_client_input_done &&
+            pollwrap_check_fd_rwx(pw, daemon_client_fd, SELECT_R)) {
+            char buf[4096];
+            int ret = read(daemon_client_fd, buf, sizeof(buf));
+            if (ret > 0) {
+                /* Buffer data; will be flushed to backend in pw_setup
+                 * once backend is connected and ready to accept it. */
+                bufchain_add(&daemon_client_input_buf, buf, ret);
+            } else if (ret == 0) {
+                /* EOF from client. Mark input as done but keep
+                 * the fd open for writing response data back. */
+                daemon_client_input_done = true;
+                shutdown(daemon_client_fd, SHUT_RD);
+            } else {
+                fprintf(stderr, "putty: client read error: %s\n",
+                        strerror(errno));
+                close_daemon_client();
+                return;
+            }
+        }
+
+        if (daemon_client_fd >= 0 &&
+            pollwrap_check_fd_rwx(pw, daemon_client_fd, SELECT_W)) {
+            try_output(false);
+            try_output(true);
+        }
+    }
+}
+
+static bool putty_daemon_continue(void *vctx, bool found_any_fd,
+                                   bool ran_any_callback)
+{
+    /* Exit on SIGINT (Ctrl+C) */
+    if (sigint_pending)
+        return false;
+    /* Keep running as long as SSH connection is alive */
+    if (!backend_connected(backend))
+        return false;
+    return true;
+}
+
+/*
+ * Client mode: connect to a daemon's Unix socket and relay stdin/stdout.
+ * This is a standalone mode that does NOT create an SSH connection.
+ */
+static int run_client_mode(const char *socket_path, const char *command)
+{
+    struct sockaddr_un addr;
+    int fd, ret, exitcode = 0;
+    char buf[4096];
+    fd_set rfds;
+    bool stdin_done = false;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "putty: unable to create socket: %s\n",
+                strerror(errno));
+        return 1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0) {
+        fprintf(stderr, "putty: unable to connect to daemon at '%s': %s\n",
+                socket_path, strerror(errno));
+        close(fd);
+        return 1;
+    }
+
+    /* If a command was provided on the command line, send it immediately.
+     * Do NOT call shutdown(SHUT_WR) here — doing so causes a race on
+     * macOS Unix sockets where POLLHUP arrives before POLLIN, causing
+     * the daemon to see EOF before reading the data, losing the command. */
+    if (command && *command) {
+        char *cmdline = dupprintf("%s\n", command);
+        write(fd, cmdline, strlen(cmdline));
+        sfree(cmdline);
+        stdin_done = true;
+    }
+
+    /* Relay stdin <-> socket bidirectionally */
+    bool saw_data = false;
+    struct timeval start_time, last_data_time;
+    bool start_time_set = false, last_data_set = false;
+    while (1) {
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        int maxfd = fd;
+
+        if (!stdin_done) {
+            FD_SET(STDIN_FILENO, &rfds);
+            if (STDIN_FILENO > maxfd)
+                maxfd = STDIN_FILENO;
+        }
+
+        if (stdin_done) {
+            /* After sending all input, use a timeout to avoid hanging.
+             * Polling interval: 200ms. Exit when no data has arrived
+             * for 500ms after the last received byte (or 15s total
+             * if we never received anything). */
+            struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+            ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+            if (ret == 0) {
+                if (saw_data && last_data_set) {
+                    struct timeval now;
+                    gettimeofday(&now, NULL);
+                    long elapsed_ms = (now.tv_sec - last_data_time.tv_sec) * 1000
+                        + (now.tv_usec - last_data_time.tv_usec) / 1000;
+                    if (elapsed_ms >= 500) {
+                        break;
+                    }
+                }
+                /* Check total wait timeout for first byte */
+                if (!start_time_set) {
+                    gettimeofday(&start_time, NULL);
+                    start_time_set = true;
+                }
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                if (now.tv_sec - start_time.tv_sec > 15) {
+                    fprintf(stderr, "putty: no response from daemon "
+                            "(SSH connection may not be ready)\n");
+                    exitcode = 1;
+                    break;
+                }
+                continue;
+            }
+        } else {
+            ret = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        }
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        /* Forward stdin data to daemon */
+        if (!stdin_done && FD_ISSET(STDIN_FILENO, &rfds)) {
+            ret = read(STDIN_FILENO, buf, sizeof(buf));
+            if (ret > 0) {
+                write(fd, buf, ret);
+            } else {
+                /* stdin EOF: shut down write side of socket */
+                shutdown(fd, SHUT_WR);
+                stdin_done = true;
+            }
+        }
+
+        /* Forward daemon response to stdout */
+        if (FD_ISSET(fd, &rfds)) {
+            ret = read(fd, buf, sizeof(buf));
+            if (ret > 0) {
+                write(STDOUT_FILENO, buf, ret);
+                saw_data = true;
+                gettimeofday(&last_data_time, NULL);
+                last_data_set = true;
+            } else {
+                fprintf(stderr, "putty-cli: daemon closed connection\n");
+                break;
+            }
+        }
+    }
+
+    close(fd);
+    return exitcode;
+}
+
 int main(int argc, char **argv)
 {
     int exitcode;
@@ -701,6 +1120,26 @@ int main(int argc, char **argv)
             sanitise_stderr = FORCE_OFF;
         } else if (!strcmp(p, "-no-antispoof")) {
             console_antispoof_prompt = false;
+        } else if (!strcmp(p, "--daemon")) {
+            if (nextarg) {
+                daemon_mode = true;
+                daemon_socket_path = dupstr(cmdline_arg_to_str(nextarg));
+                arglistpos++;
+            } else {
+                fprintf(stderr, "putty: option \"--daemon\""
+                        " requires a socket path argument\n");
+                errors = true;
+            }
+        } else if (!strcmp(p, "--connect")) {
+            if (nextarg) {
+                client_mode = true;
+                client_socket_path = dupstr(cmdline_arg_to_str(nextarg));
+                arglistpos++;
+            } else {
+                fprintf(stderr, "putty: option \"--connect\""
+                        " requires a socket path argument\n");
+                errors = true;
+            }
         } else if (*p != '-') {
             strbuf *cmdbuf = strbuf_new();
 
@@ -725,6 +1164,26 @@ int main(int argc, char **argv)
 
     if (errors)
         return 1;
+
+    /* If in client mode, skip SSH setup and connect to daemon */
+    if (client_mode) {
+        cmdline_arg_list_free(arglist);
+        const char *cmd = conf_get_str_ambi(conf, CONF_remote_cmd, NULL);
+        if (!cmd || !*cmd) {
+            /* No explicit remote command found. But cmdline_process_param
+             * may have stored a positional argument as CONF_host.
+             * In client mode, positional arguments after --connect
+             * are the command to execute, not a host name. */
+            cmd = conf_get_str(conf, CONF_host);
+            /* If it looks like user@host, strip it */
+            if (cmd && *cmd) {
+                const char *at = strrchr(cmd, '@');
+                if (at) cmd = at + 1;
+            }
+        }
+        return run_client_mode(client_socket_path,
+                               (cmd && *cmd) ? cmd : NULL);
+    }
 
     if (!cmdline_host_ok(conf)) {
         fprintf(stderr, "putty: no valid host name provided\n"
@@ -761,6 +1220,22 @@ int main(int argc, char **argv)
         conf_set_bool(conf, CONF_ssh_subsys, true);
 
     /*
+     * Create daemon socket if in daemon mode.
+     */
+    if (daemon_mode) {
+        daemon_listen_fd = create_daemon_socket(daemon_socket_path);
+        if (daemon_listen_fd < 0)
+            return 1;
+        atexit(cleanup_daemon_socket);
+        /* In daemon mode, skip interactive prompts */
+        console_antispoof_prompt = false;
+        /* No pty — avoids command echo and prompt noise in output,
+         * and is the right default for programmatic command relay. */
+        conf_set_bool(conf, CONF_nopty, true);
+        bufchain_init(&daemon_client_input_buf);
+    }
+
+    /*
      * Select protocol.
      */
     backvt = backend_vt_from_proto(conf_get_int(conf, CONF_protocol));
@@ -795,6 +1270,15 @@ int main(int argc, char **argv)
     cloexec(signalpipe[0]);
     cloexec(signalpipe[1]);
     putty_signal(SIGWINCH, sigwinch);
+    if (daemon_mode) {
+        /* Install SIGINT handler WITHOUT SA_RESTART so that poll()
+         * returns EINTR on Ctrl+C, instead of auto-restarting. */
+        struct sigaction sa;
+        sa.sa_handler = sigint;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;  /* no SA_RESTART! */
+        sigaction(SIGINT, &sa, NULL);
+    }
 
     /*
      * Now that we've got the SIGWINCH handler installed, try to find
@@ -879,10 +1363,19 @@ int main(int argc, char **argv)
      * Set up the initial console mode.
      */
     local_tty = (tcgetattr(STDIN_FILENO, &orig_termios) == 0);
+    /* In daemon mode, don't modify terminal settings — we want
+     * Ctrl+C to keep working, and we don't read from stdin. */
+    if (daemon_mode)
+        local_tty = false;
     atexit(cleanup_termios);
     seat_echoedit_update(putty_cli_seat, 1, 1);
 
-    cli_main_loop(putty_cli_pw_setup, putty_cli_pw_check, putty_cli_continue, NULL);
+    if (daemon_mode)
+        cli_main_loop(putty_daemon_pw_setup, putty_daemon_pw_check,
+                      putty_daemon_continue, NULL);
+    else
+        cli_main_loop(putty_cli_pw_setup, putty_cli_pw_check,
+                      putty_cli_continue, NULL);
 
     exitcode = backend_exitcode(backend);
     if (exitcode < 0) {
